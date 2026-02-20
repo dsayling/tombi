@@ -5,8 +5,6 @@ use tombi_schema_store::{
     Accessor, AllOfSchema, AnyOfSchema, CurrentSchema, DocumentSchema, OneOfSchema, PropertySchema,
     SchemaAccessor, ValueSchema,
 };
-use tombi_validator::Validate;
-
 mod array;
 mod array_of_table;
 mod inline_table;
@@ -80,10 +78,12 @@ fn edit_recursive<'a: 'b, 'b>(
                             .await
                         {
                             let current_schema = current_schema.into_owned();
-                            if node
-                                .validate(accessors.as_ref(), Some(&current_schema), schema_context)
-                                .await
-                                .is_ok()
+                            if crate::matches_schema::matches_schema_value(
+                                node,
+                                &current_schema,
+                                schema_context,
+                            )
+                            .await
                             {
                                 return edit_recursive(
                                     node,
