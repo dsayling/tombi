@@ -1,4 +1,4 @@
-use std::{borrow::Cow, str::FromStr};
+use std::{borrow::Cow, collections::HashSet, str::FromStr};
 
 use tombi_x_keyword::StringFormat;
 
@@ -110,6 +110,19 @@ impl Referable<ValueSchema> {
         schema_store: &'a crate::SchemaStore,
     ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
         Box::pin(async move {
+            self.resolve_inner(schema_uri, definitions, schema_store, &mut HashSet::new())
+                .await
+        })
+    }
+
+    fn resolve_inner<'a: 'b, 'b>(
+        &'a mut self,
+        schema_uri: Cow<'a, SchemaUri>,
+        definitions: Cow<'a, SchemaDefinitions>,
+        schema_store: &'a crate::SchemaStore,
+        visited_refs: &'b mut HashSet<String>,
+    ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
+        Box::pin(async move {
             match self {
                 Referable::Ref {
                     reference,
@@ -117,6 +130,11 @@ impl Referable<ValueSchema> {
                     description,
                     deprecated,
                 } => {
+                    // Detect circular $ref to prevent infinite loops
+                    if !visited_refs.insert(reference.clone()) {
+                        return Ok(None);
+                    }
+
                     if let Some(definition_schema) = definitions.read().await.get(reference) {
                         let mut referable_schema = definition_schema.to_owned();
                         if let Referable::Resolved {
@@ -187,10 +205,11 @@ impl Referable<ValueSchema> {
                                 };
 
                                 return self
-                                    .resolve(
+                                    .resolve_inner(
                                         Cow::Owned(document_schema.schema_uri),
                                         Cow::Owned(document_schema.definitions),
                                         schema_store,
+                                        visited_refs,
                                     )
                                     .await;
                             } else {
@@ -209,7 +228,8 @@ impl Referable<ValueSchema> {
                         });
                     }
 
-                    self.resolve(schema_uri, definitions, schema_store).await
+                    self.resolve_inner(schema_uri, definitions, schema_store, visited_refs)
+                        .await
                 }
                 Referable::Resolved {
                     schema_uri: reference_url,
@@ -238,11 +258,22 @@ impl Referable<ValueSchema> {
                         ValueSchema::OneOf(OneOfSchema { schemas, .. })
                         | ValueSchema::AnyOf(AnyOfSchema { schemas, .. })
                         | ValueSchema::AllOf(AllOfSchema { schemas, .. }) => {
-                            for schema in schemas.write().await.iter_mut() {
+                            // Take schemas out to release the write lock before resolving,
+                            // preventing deadlocks when recursive resolution encounters
+                            // the same Arc<RwLock> via cloned definitions.
+                            let mut schemas_vec =
+                                std::mem::take(&mut *schemas.write().await);
+                            for schema in schemas_vec.iter_mut() {
                                 schema
-                                    .resolve(schema_uri.clone(), definitions.clone(), schema_store)
+                                    .resolve_inner(
+                                        schema_uri.clone(),
+                                        definitions.clone(),
+                                        schema_store,
+                                        visited_refs,
+                                    )
                                     .await?;
                             }
+                            *schemas.write().await = schemas_vec;
                         }
                         _ => {}
                     }
