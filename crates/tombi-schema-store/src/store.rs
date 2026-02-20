@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Deref, str::FromStr, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, ops::Deref, str::FromStr, sync::Arc};
 
 use crate::{
     AllOfSchema, AnyOfSchema, CatalogUri, DocumentSchema, OneOfSchema, SchemaAccessor,
@@ -29,6 +29,7 @@ pub struct SchemaStore {
     http_client: HttpClient,
     document_schemas:
         Arc<tokio::sync::RwLock<AHashMap<SchemaUri, Result<DocumentSchema, crate::Error>>>>,
+    resolving_schema_uris: Arc<RwLock<HashSet<String>>>,
     schemas: Arc<RwLock<Vec<crate::Schema>>>,
     options: crate::Options,
     base_dir_path: Arc<RwLock<Option<std::path::PathBuf>>>,
@@ -61,6 +62,7 @@ impl SchemaStore {
         Self {
             http_client: HttpClient::new(),
             document_schemas: Arc::new(RwLock::default()),
+            resolving_schema_uris: Arc::new(RwLock::new(HashSet::new())),
             schemas: Arc::new(RwLock::new(Vec::new())),
             options,
             base_dir_path: Arc::new(RwLock::new(None)),
@@ -521,8 +523,23 @@ impl SchemaStore {
                 };
             }
 
+            let schema_uri_key = schema_uri.to_string();
+            {
+                let mut resolving_schema_uris = self.resolving_schema_uris.write().await;
+                if !resolving_schema_uris.insert(schema_uri_key.clone()) {
+                    log::debug!("detected recursive schema fetch: {}", schema_uri);
+                    return Ok(None);
+                }
+            }
+
             // Then fetch from remote
-            match self.fetch_document_schema(schema_uri).await.transpose() {
+            let result = self.fetch_document_schema(schema_uri).await.transpose();
+            self.resolving_schema_uris
+                .write()
+                .await
+                .remove(&schema_uri_key);
+
+            match result {
                 Some(document_schema) => {
                     self.document_schemas
                         .write()
