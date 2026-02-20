@@ -56,6 +56,8 @@ impl<T> Referable<T> {
 }
 
 impl Referable<ValueSchema> {
+    const MAX_REFERENCE_RESOLVE_DEPTH: usize = 128;
+
     pub fn new(
         object: &tombi_json::ObjectNode,
         string_formats: Option<&[StringFormat]>,
@@ -109,7 +111,21 @@ impl Referable<ValueSchema> {
         definitions: Cow<'a, SchemaDefinitions>,
         schema_store: &'a crate::SchemaStore,
     ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
+        self.resolve_with_depth(schema_uri, definitions, schema_store, 0, Vec::new())
+    }
+
+    fn resolve_with_depth<'a: 'b, 'b>(
+        &'a mut self,
+        schema_uri: Cow<'a, SchemaUri>,
+        definitions: Cow<'a, SchemaDefinitions>,
+        schema_store: &'a crate::SchemaStore,
+        depth: usize,
+        visited_references: Vec<String>,
+    ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
         Box::pin(async move {
+            if depth > Self::MAX_REFERENCE_RESOLVE_DEPTH {
+                return Ok(None);
+            }
             match self {
                 Referable::Ref {
                     reference,
@@ -117,6 +133,15 @@ impl Referable<ValueSchema> {
                     description,
                     deprecated,
                 } => {
+                    let mut visited_references = visited_references;
+                    if visited_references
+                        .iter()
+                        .any(|visited| visited == reference)
+                    {
+                        return Ok(None);
+                    }
+                    visited_references.push(reference.clone());
+
                     if let Some(definition_schema) = definitions.read().await.get(reference) {
                         let mut referable_schema = definition_schema.to_owned();
                         if let Referable::Resolved {
@@ -187,10 +212,12 @@ impl Referable<ValueSchema> {
                                 };
 
                                 return self
-                                    .resolve(
+                                    .resolve_with_depth(
                                         Cow::Owned(document_schema.schema_uri),
                                         Cow::Owned(document_schema.definitions),
                                         schema_store,
+                                        depth + 1,
+                                        visited_references,
                                     )
                                     .await;
                             } else {
@@ -209,7 +236,14 @@ impl Referable<ValueSchema> {
                         });
                     }
 
-                    self.resolve(schema_uri, definitions, schema_store).await
+                    self.resolve_with_depth(
+                        schema_uri,
+                        definitions,
+                        schema_store,
+                        depth + 1,
+                        visited_references,
+                    )
+                    .await
                 }
                 Referable::Resolved {
                     schema_uri: reference_url,
@@ -240,7 +274,13 @@ impl Referable<ValueSchema> {
                         | ValueSchema::AllOf(AllOfSchema { schemas, .. }) => {
                             for schema in schemas.write().await.iter_mut() {
                                 schema
-                                    .resolve(schema_uri.clone(), definitions.clone(), schema_store)
+                                    .resolve_with_depth(
+                                        schema_uri.clone(),
+                                        definitions.clone(),
+                                        schema_store,
+                                        depth + 1,
+                                        visited_references.clone(),
+                                    )
                                     .await?;
                             }
                         }
@@ -371,9 +411,12 @@ fn percent_decode(input: &str) -> String {
 
 #[cfg(test)]
 mod test {
-    use std::str::FromStr;
+    use std::{borrow::Cow, str::FromStr, sync::Arc};
 
-    use crate::{ValueSchema, schema::referable_schema::resolve_json_pointer};
+    use crate::{
+        Referable, SchemaDefinitions, SchemaStore, SchemaUri, ValueSchema,
+        schema::referable_schema::resolve_json_pointer,
+    };
 
     #[test]
     fn test_json_pointer_percent_decode() {
@@ -449,5 +492,49 @@ mod test {
         if let Ok(Some(schema)) = result {
             assert!(matches!(schema, ValueSchema::String(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stops_on_circular_definition_reference() {
+        let definitions: SchemaDefinitions =
+            Arc::new(tokio::sync::RwLock::new(ahash::AHashMap::from_iter([
+                (
+                    "#/definitions/a".to_string(),
+                    Referable::Ref {
+                        reference: "#/definitions/b".to_string(),
+                        title: None,
+                        description: None,
+                        deprecated: None,
+                    },
+                ),
+                (
+                    "#/definitions/b".to_string(),
+                    Referable::Ref {
+                        reference: "#/definitions/a".to_string(),
+                        title: None,
+                        description: None,
+                        deprecated: None,
+                    },
+                ),
+            ])));
+        let schema_uri = SchemaUri::from_str("https://example.com/test-schema.json").unwrap();
+        let schema_store = SchemaStore::new();
+        let mut referable = Referable::Ref {
+            reference: "#/definitions/a".to_string(),
+            title: None,
+            description: None,
+            deprecated: None,
+        };
+
+        let resolved = referable
+            .resolve(
+                Cow::Owned(schema_uri),
+                Cow::Owned(definitions),
+                &schema_store,
+            )
+            .await;
+
+        assert!(resolved.is_ok());
+        assert!(resolved.unwrap().is_none());
     }
 }
