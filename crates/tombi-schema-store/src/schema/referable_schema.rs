@@ -56,6 +56,8 @@ impl<T> Referable<T> {
 }
 
 impl Referable<ValueSchema> {
+    const MAX_RESOLVE_DEPTH: usize = 64;
+
     pub fn new(
         object: &tombi_json::ObjectNode,
         string_formats: Option<&[StringFormat]>,
@@ -108,6 +110,16 @@ impl Referable<ValueSchema> {
         schema_uri: Cow<'a, SchemaUri>,
         definitions: Cow<'a, SchemaDefinitions>,
         schema_store: &'a crate::SchemaStore,
+    ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
+        self.resolve_with_depth(schema_uri, definitions, schema_store, 0)
+    }
+
+    fn resolve_with_depth<'a: 'b, 'b>(
+        &'a mut self,
+        schema_uri: Cow<'a, SchemaUri>,
+        definitions: Cow<'a, SchemaDefinitions>,
+        schema_store: &'a crate::SchemaStore,
+        depth: usize,
     ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
         Box::pin(async move {
             match self {
@@ -187,10 +199,11 @@ impl Referable<ValueSchema> {
                                 };
 
                                 return self
-                                    .resolve(
+                                    .resolve_with_depth(
                                         Cow::Owned(document_schema.schema_uri),
                                         Cow::Owned(document_schema.definitions),
                                         schema_store,
+                                        depth + 1,
                                     )
                                     .await;
                             } else {
@@ -209,13 +222,22 @@ impl Referable<ValueSchema> {
                         });
                     }
 
-                    self.resolve(schema_uri, definitions, schema_store).await
+                    self.resolve_with_depth(schema_uri, definitions, schema_store, depth + 1)
+                        .await
                 }
                 Referable::Resolved {
                     schema_uri: reference_url,
                     value: value_schema,
                     ..
                 } => {
+                    if depth >= Self::MAX_RESOLVE_DEPTH {
+                        return Ok(Some(CurrentSchema {
+                            value_schema: Cow::Borrowed(value_schema),
+                            schema_uri,
+                            definitions,
+                        }));
+                    }
+
                     let (schema_uri, definitions) = {
                         match reference_url {
                             Some(reference_url) => {
@@ -238,11 +260,21 @@ impl Referable<ValueSchema> {
                         ValueSchema::OneOf(OneOfSchema { schemas, .. })
                         | ValueSchema::AnyOf(AnyOfSchema { schemas, .. })
                         | ValueSchema::AllOf(AllOfSchema { schemas, .. }) => {
-                            for schema in schemas.write().await.iter_mut() {
+                            let mut referable_schemas = {
+                                let mut schemas = schemas.write().await;
+                                std::mem::take(&mut *schemas)
+                            };
+                            for schema in &mut referable_schemas {
                                 schema
-                                    .resolve(schema_uri.clone(), definitions.clone(), schema_store)
+                                    .resolve_with_depth(
+                                        schema_uri.clone(),
+                                        definitions.clone(),
+                                        schema_store,
+                                        depth + 1,
+                                    )
                                     .await?;
                             }
+                            *schemas.write().await = referable_schemas;
                         }
                         _ => {}
                     }
@@ -371,9 +403,12 @@ fn percent_decode(input: &str) -> String {
 
 #[cfg(test)]
 mod test {
-    use std::str::FromStr;
+    use std::{borrow::Cow, str::FromStr, sync::Arc};
 
-    use crate::{ValueSchema, schema::referable_schema::resolve_json_pointer};
+    use crate::{
+        Referable, SchemaDefinitions, SchemaStore, SchemaUri, ValueSchema,
+        schema::{OneOfSchema, referable_schema::resolve_json_pointer},
+    };
 
     #[test]
     fn test_json_pointer_percent_decode() {
@@ -449,5 +484,47 @@ mod test {
         if let Ok(Some(schema)) = result {
             assert!(matches!(schema, ValueSchema::String(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stops_recursive_definition_loop() {
+        let recursive_schema = Referable::Resolved {
+            schema_uri: None,
+            value: ValueSchema::OneOf(OneOfSchema {
+                schemas: Arc::new(tokio::sync::RwLock::new(vec![Referable::Ref {
+                    reference: "#/definitions/node".to_string(),
+                    title: None,
+                    description: None,
+                    deprecated: None,
+                }])),
+                ..Default::default()
+            }),
+        };
+
+        let definitions: SchemaDefinitions = Arc::new(tokio::sync::RwLock::new(
+            [("#/definitions/node".to_string(), recursive_schema)]
+                .into_iter()
+                .collect(),
+        ));
+        let schema_uri = SchemaUri::from_str("file:///tmp/recursive.schema.json").unwrap();
+        let schema_store = SchemaStore::new();
+
+        let mut referable = Referable::Ref {
+            reference: "#/definitions/node".to_string(),
+            title: None,
+            description: None,
+            deprecated: None,
+        };
+        let resolved = referable
+            .resolve(
+                Cow::Borrowed(&schema_uri),
+                Cow::Borrowed(&definitions),
+                &schema_store,
+            )
+            .await
+            .unwrap();
+
+        assert!(resolved.is_some());
+        assert!(matches!(referable, Referable::Resolved { .. }));
     }
 }
