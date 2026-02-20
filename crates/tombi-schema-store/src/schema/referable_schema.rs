@@ -130,7 +130,9 @@ impl Referable<ValueSchema> {
                     description,
                     deprecated,
                 } => {
-                    // Detect circular $ref to prevent infinite loops
+                    // Detect circular $ref to prevent infinite loops.
+                    // Returning Ok(None) leaves the Ref unresolved, which is safe:
+                    // callers treat None as "schema not available" and skip validation.
                     if !visited_refs.insert(reference.clone()) {
                         return Ok(None);
                     }
