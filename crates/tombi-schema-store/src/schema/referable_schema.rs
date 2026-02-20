@@ -56,6 +56,7 @@ impl<T> Referable<T> {
 }
 
 impl Referable<ValueSchema> {
+    // Guard against unbounded recursion when schemas contain circular references.
     const MAX_RESOLVE_DEPTH: usize = 64;
 
     pub fn new(
@@ -119,6 +120,7 @@ impl Referable<ValueSchema> {
         schema_uri: Cow<'a, SchemaUri>,
         definitions: Cow<'a, SchemaDefinitions>,
         schema_store: &'a crate::SchemaStore,
+        // Tracks recursive resolution depth to avoid infinite loops.
         depth: usize,
     ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
         Box::pin(async move {
@@ -231,6 +233,11 @@ impl Referable<ValueSchema> {
                     ..
                 } => {
                     if depth >= Self::MAX_RESOLVE_DEPTH {
+                        log::debug!(
+                            "schema resolution depth limit reached ({}) for {}",
+                            Self::MAX_RESOLVE_DEPTH,
+                            schema_uri
+                        );
                         return Ok(Some(CurrentSchema {
                             value_schema: Cow::Borrowed(value_schema),
                             schema_uri,
@@ -260,10 +267,8 @@ impl Referable<ValueSchema> {
                         ValueSchema::OneOf(OneOfSchema { schemas, .. })
                         | ValueSchema::AnyOf(AnyOfSchema { schemas, .. })
                         | ValueSchema::AllOf(AllOfSchema { schemas, .. }) => {
-                            let mut referable_schemas = {
-                                let mut schemas = schemas.write().await;
-                                std::mem::take(&mut *schemas)
-                            };
+                            // Avoid holding a schema lock while awaiting recursive resolution.
+                            let mut referable_schemas = schemas.read().await.clone();
                             for schema in &mut referable_schemas {
                                 schema
                                     .resolve_with_depth(
