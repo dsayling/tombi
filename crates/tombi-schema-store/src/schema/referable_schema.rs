@@ -1,4 +1,4 @@
-use std::{borrow::Cow, str::FromStr};
+use std::{borrow::Cow, collections::HashSet, str::FromStr};
 
 use tombi_x_keyword::StringFormat;
 
@@ -110,6 +110,19 @@ impl Referable<ValueSchema> {
         schema_store: &'a crate::SchemaStore,
     ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
         Box::pin(async move {
+            self.resolve_inner(schema_uri, definitions, schema_store, &mut HashSet::new())
+                .await
+        })
+    }
+
+    fn resolve_inner<'a: 'b, 'b>(
+        &'a mut self,
+        schema_uri: Cow<'a, SchemaUri>,
+        definitions: Cow<'a, SchemaDefinitions>,
+        schema_store: &'a crate::SchemaStore,
+        visited_refs: &'b mut HashSet<String>,
+    ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
+        Box::pin(async move {
             match self {
                 Referable::Ref {
                     reference,
@@ -117,13 +130,29 @@ impl Referable<ValueSchema> {
                     description,
                     deprecated,
                 } => {
-                    if let Some(definition_schema) = definitions.read().await.get(reference) {
-                        let mut referable_schema = definition_schema.to_owned();
+                    // Detect circular $ref to prevent infinite loops.
+                    // Returning Ok(None) leaves the Ref unresolved, which is safe:
+                    // callers treat None as "schema not available" and skip validation.
+                    if !visited_refs.insert(reference.clone()) {
+                        return Ok(None);
+                    }
+
+                    // Look up the definition and clone it. Using .cloned() to
+                    // release the definitions read lock immediately, before we
+                    // deep-clone inner Arcs on the result.
+                    let definition_clone =
+                        definitions.read().await.get(reference).cloned();
+
+                    if let Some(mut referable_schema) = definition_clone {
                         if let Referable::Resolved {
                             value: value_schema,
                             ..
                         } = &mut referable_schema
                         {
+                            // Deep-clone inner Arc fields so this resolved schema
+                            // has independent locks, preventing deadlocks when
+                            // other code paths hold locks on the original definition.
+                            value_schema.deep_clone_arcs().await;
                             if title.is_some() || description.is_some() {
                                 value_schema.set_title(title.to_owned());
                                 value_schema.set_description(description.to_owned());
@@ -187,10 +216,11 @@ impl Referable<ValueSchema> {
                                 };
 
                                 return self
-                                    .resolve(
+                                    .resolve_inner(
                                         Cow::Owned(document_schema.schema_uri),
                                         Cow::Owned(document_schema.definitions),
                                         schema_store,
+                                        visited_refs,
                                     )
                                     .await;
                             } else {
@@ -209,7 +239,8 @@ impl Referable<ValueSchema> {
                         });
                     }
 
-                    self.resolve(schema_uri, definitions, schema_store).await
+                    self.resolve_inner(schema_uri, definitions, schema_store, visited_refs)
+                        .await
                 }
                 Referable::Resolved {
                     schema_uri: reference_url,
@@ -240,7 +271,12 @@ impl Referable<ValueSchema> {
                         | ValueSchema::AllOf(AllOfSchema { schemas, .. }) => {
                             for schema in schemas.write().await.iter_mut() {
                                 schema
-                                    .resolve(schema_uri.clone(), definitions.clone(), schema_store)
+                                    .resolve_inner(
+                                        schema_uri.clone(),
+                                        definitions.clone(),
+                                        schema_store,
+                                        visited_refs,
+                                    )
                                     .await?;
                             }
                         }

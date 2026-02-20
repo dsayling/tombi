@@ -2,6 +2,7 @@ use std::{borrow::Cow, str::FromStr, sync::Arc};
 
 use futures::future::join_all;
 use indexmap::IndexSet;
+use tokio::sync::RwLock;
 use tombi_future::{BoxFuture, Boxable};
 use tombi_json::StringNode;
 use tombi_x_keyword::{StringFormat, TableKeysOrder, X_TOMBI_TABLE_KEYS_ORDER};
@@ -99,6 +100,97 @@ impl ValueSchema {
         }
 
         None
+    }
+
+    /// Recursively create new `Arc`s for ALL inner shared fields to prevent
+    /// deadlocks caused by multiple clones pointing to the same `RwLock`.
+    ///
+    /// This must be called after cloning a schema from the definitions map
+    /// so that the clone has fully independent locks at every nesting level.
+    /// Since definition entries are never mutated (only clones are), there
+    /// are no Arc-level cycles — only string-level `$ref` cycles — so this
+    /// recursion always terminates.
+    pub fn deep_clone_arcs<'a>(&'a mut self) -> tombi_future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            match self {
+                ValueSchema::OneOf(OneOfSchema { schemas, not, .. })
+                | ValueSchema::AnyOf(AnyOfSchema { schemas, not, .. })
+                | ValueSchema::AllOf(AllOfSchema { schemas, not, .. }) => {
+                    let mut cloned = schemas.read().await.clone();
+                    for referable in &mut cloned {
+                        if let Referable::Resolved { value, .. } = referable {
+                            value.deep_clone_arcs().await;
+                        }
+                    }
+                    *schemas = Arc::new(RwLock::new(cloned));
+                    if let Some(not_schema) = not {
+                        let mut cloned_not = not_schema.schema.read().await.clone();
+                        if let Referable::Resolved { value, .. } = &mut cloned_not {
+                            value.deep_clone_arcs().await;
+                        }
+                        not_schema.schema = Arc::new(RwLock::new(cloned_not));
+                    }
+                }
+                ValueSchema::Table(TableSchema {
+                    properties,
+                    pattern_properties,
+                    additional_property_schema,
+                    not,
+                    ..
+                }) => {
+                    let mut cloned_props = properties.read().await.clone();
+                    for prop in cloned_props.values_mut() {
+                        if let Referable::Resolved { value, .. } = &mut prop.property_schema {
+                            value.deep_clone_arcs().await;
+                        }
+                    }
+                    *properties = Arc::new(RwLock::new(cloned_props));
+
+                    if let Some(pp) = pattern_properties {
+                        let mut cloned_pp = pp.read().await.clone();
+                        for prop in cloned_pp.values_mut() {
+                            if let Referable::Resolved { value, .. } = &mut prop.property_schema {
+                                value.deep_clone_arcs().await;
+                            }
+                        }
+                        *pp = Arc::new(RwLock::new(cloned_pp));
+                    }
+
+                    if let Some((_, item)) = additional_property_schema {
+                        let mut cloned_item = item.read().await.clone();
+                        if let Referable::Resolved { value, .. } = &mut cloned_item {
+                            value.deep_clone_arcs().await;
+                        }
+                        *item = Arc::new(RwLock::new(cloned_item));
+                    }
+
+                    if let Some(not_schema) = not {
+                        let mut cloned_not = not_schema.schema.read().await.clone();
+                        if let Referable::Resolved { value, .. } = &mut cloned_not {
+                            value.deep_clone_arcs().await;
+                        }
+                        not_schema.schema = Arc::new(RwLock::new(cloned_not));
+                    }
+                }
+                ValueSchema::Array(ArraySchema { items, not, .. }) => {
+                    if let Some(item) = items {
+                        let mut cloned = item.read().await.clone();
+                        if let Referable::Resolved { value, .. } = &mut cloned {
+                            value.deep_clone_arcs().await;
+                        }
+                        *item = Arc::new(RwLock::new(cloned));
+                    }
+                    if let Some(not_schema) = not {
+                        let mut cloned_not = not_schema.schema.read().await.clone();
+                        if let Referable::Resolved { value, .. } = &mut cloned_not {
+                            value.deep_clone_arcs().await;
+                        }
+                        not_schema.schema = Arc::new(RwLock::new(cloned_not));
+                    }
+                }
+                _ => {}
+            }
+        })
     }
 
     fn new_single(
