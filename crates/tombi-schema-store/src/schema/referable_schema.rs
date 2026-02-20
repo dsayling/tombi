@@ -1,4 +1,4 @@
-use std::{borrow::Cow, str::FromStr};
+use std::{borrow::Cow, collections::HashSet, str::FromStr};
 
 use tombi_x_keyword::StringFormat;
 
@@ -56,9 +56,6 @@ impl<T> Referable<T> {
 }
 
 impl Referable<ValueSchema> {
-    // Guard against unbounded recursion when schemas contain circular references.
-    const MAX_RESOLVE_DEPTH: usize = 64;
-
     pub fn new(
         object: &tombi_json::ObjectNode,
         string_formats: Option<&[StringFormat]>,
@@ -112,16 +109,20 @@ impl Referable<ValueSchema> {
         definitions: Cow<'a, SchemaDefinitions>,
         schema_store: &'a crate::SchemaStore,
     ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
-        self.resolve_with_depth(schema_uri, definitions, schema_store, 0)
+        self.resolve_with_visited(
+            schema_uri,
+            definitions,
+            schema_store,
+            HashSet::<(String, String)>::new(),
+        )
     }
 
-    fn resolve_with_depth<'a: 'b, 'b>(
+    fn resolve_with_visited<'a: 'b, 'b>(
         &'a mut self,
         schema_uri: Cow<'a, SchemaUri>,
         definitions: Cow<'a, SchemaDefinitions>,
         schema_store: &'a crate::SchemaStore,
-        // Tracks recursive resolution depth to avoid infinite loops.
-        depth: usize,
+        mut visited: HashSet<(String, String)>,
     ) -> tombi_future::BoxFuture<'b, Result<Option<CurrentSchema<'a>>, crate::Error>> {
         Box::pin(async move {
             match self {
@@ -131,6 +132,17 @@ impl Referable<ValueSchema> {
                     description,
                     deprecated,
                 } => {
+                    let schema_uri_string = schema_uri.to_string();
+                    let cycle_key = (schema_uri_string.clone(), reference.clone());
+                    if !visited.insert(cycle_key) {
+                        log::debug!(
+                            "schema reference cycle detected: {} -> {}",
+                            schema_uri_string,
+                            reference
+                        );
+                        return Ok(None);
+                    }
+
                     if let Some(definition_schema) = definitions.read().await.get(reference) {
                         let mut referable_schema = definition_schema.to_owned();
                         if let Referable::Resolved {
@@ -201,11 +213,11 @@ impl Referable<ValueSchema> {
                                 };
 
                                 return self
-                                    .resolve_with_depth(
+                                    .resolve_with_visited(
                                         Cow::Owned(document_schema.schema_uri),
                                         Cow::Owned(document_schema.definitions),
                                         schema_store,
-                                        depth + 1,
+                                        visited,
                                     )
                                     .await;
                             } else {
@@ -224,7 +236,7 @@ impl Referable<ValueSchema> {
                         });
                     }
 
-                    self.resolve_with_depth(schema_uri, definitions, schema_store, depth + 1)
+                    self.resolve_with_visited(schema_uri, definitions, schema_store, visited)
                         .await
                 }
                 Referable::Resolved {
@@ -232,19 +244,6 @@ impl Referable<ValueSchema> {
                     value: value_schema,
                     ..
                 } => {
-                    if depth >= Self::MAX_RESOLVE_DEPTH {
-                        log::debug!(
-                            "schema resolution depth limit reached ({}) for {}",
-                            Self::MAX_RESOLVE_DEPTH,
-                            schema_uri
-                        );
-                        return Ok(Some(CurrentSchema {
-                            value_schema: Cow::Borrowed(value_schema),
-                            schema_uri,
-                            definitions,
-                        }));
-                    }
-
                     let (schema_uri, definitions) = {
                         match reference_url {
                             Some(reference_url) => {
@@ -270,12 +269,13 @@ impl Referable<ValueSchema> {
                             // Avoid holding a schema lock while awaiting recursive resolution.
                             let mut referable_schemas = schemas.read().await.clone();
                             for schema in &mut referable_schemas {
+                                // Use a per-branch visited path so sibling branches can reuse refs.
                                 schema
-                                    .resolve_with_depth(
+                                    .resolve_with_visited(
                                         schema_uri.clone(),
                                         definitions.clone(),
                                         schema_store,
-                                        depth + 1,
+                                        visited.clone(),
                                     )
                                     .await?;
                             }
